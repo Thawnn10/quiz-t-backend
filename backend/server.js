@@ -102,11 +102,18 @@ const EN_MEANING_MAP = {
 // ============================================================
 const VI_DIACRITIC_RE =
   /[ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ]/i;
+const VI_SPECIFIC_DIACRITIC_RE = /[ăâđêôơư]/i;
+const PINYIN_TONE_RE = /[āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]/i;
 
 function hasVietnameseDiacritic(s) {
   return typeof s === 'string' && VI_DIACRITIC_RE.test(s);
 }
-
+function hasVietnameseOnlyDiacritic(s) {
+  return typeof s === 'string' && VI_SPECIFIC_DIACRITIC_RE.test(s);
+}
+function hasPinyinTone(s) {
+  return typeof s === 'string' && PINYIN_TONE_RE.test(s);
+}
 function hasChinese(s) {
   return typeof s === 'string' && /[\u4e00-\u9fff]/.test(s);
 }
@@ -133,7 +140,6 @@ function looksLikeEnglish(text) {
   ).length;
   if (matchCount >= 1) return true;
 
-  // Toàn bộ từ đều Latin không dấu và không phải số → nghi tiếng Anh
   if (words.every(w => /^[a-zA-Z'-]+$/.test(w)) && /[a-zA-Z]/.test(s)) return true;
   return false;
 }
@@ -149,10 +155,76 @@ function sanitizeText(text) {
   return out;
 }
 
-function isCleanQuestion(q) {
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// ============================================================
+//         KIỂM TRA NGÔN NGỮ OPTIONS (đáp án chung 1 ngôn ngữ)
+// ============================================================
+function isPinyinLike(s) {
+  if (!s || typeof s !== 'string') return false;
+  const t = s.trim();
+  if (!t) return false;
+  if (hasChinese(t)) return false;
+  if (hasVietnameseOnlyDiacritic(t)) return false; // pinyin không có ă â đ ê ô ơ ư
+  // pinyin: chữ Latin (kể cả có thanh điệu) + dấu cách/'-'
+  return /^[a-zāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜü\s'\-]+$/i.test(t);
+}
+
+/**
+ * Kiểm tra tất cả options của câu hỏi dùng CÙNG MỘT loại ngôn ngữ,
+ * tương ứng với loại câu hỏi.
+ */
+function validateOptionLanguage(q, translations = []) {
+  const type = q.type || 'meaning';
+  const opts = (q.options || []).map(o => String(o).trim()).filter(Boolean);
+  if (opts.length < 2) return false;
+
+  const trSet = new Set(translations.map(t => String(t).toLowerCase().trim()));
+
+  // ---- Hán tự ----
+  if (type === 'hanzi' || type === 'fill_hanzi') {
+    return opts.every(hasChinese);
+  }
+
+  // ---- Pinyin ----
+  if (type === 'pinyin') {
+    return opts.every(o => isPinyinLike(o) && !hasVietnameseDiacritic(o) === false ? true : isPinyinLike(o));
+  }
+
+  // ---- Nghĩa tiếng Việt ----
+  if (type === 'meaning' || type === 'fill_meaning') {
+    return opts.every(o => {
+      const lower = o.toLowerCase();
+      if (trSet.has(lower)) return true;
+      if (hasChinese(o)) return false;
+      if (hasVietnameseDiacritic(o)) return true;
+      // Không dấu — chỉ chấp nhận nếu KHÔNG giống tiếng Anh
+      return !looksLikeEnglish(o);
+    });
+  }
+
+  // ---- fill_blank: hoặc toàn Hán tự, hoặc toàn tiếng Việt ----
+  if (type === 'fill_blank') {
+    const allZh = opts.every(hasChinese);
+    const allVi = opts.every(o => !hasChinese(o) && (hasVietnameseDiacritic(o) || !looksLikeEnglish(o)));
+    return allZh || allVi;
+  }
+
+  return false;
+}
+
+function isCleanQuestion(q, translations = []) {
   if (!q || typeof q !== 'object') return false;
   const texts = [q.question, q.answer, q.explanation, ...(q.options || [])];
-  return texts.every(t => !looksLikeEnglish(t));
+  if (!texts.every(t => !looksLikeEnglish(t))) return false;
+  return validateOptionLanguage(q, translations);
 }
 
 // ============================================================
@@ -162,21 +234,13 @@ async function translateMeaningToVietnamese(text) {
   if (!text || typeof text !== 'string') return text;
   const trimmed = text.trim();
   if (!trimmed) return trimmed;
-
-  // Đã có dấu tiếng Việt → giữ nguyên
   if (hasVietnameseDiacritic(trimmed)) return trimmed;
-
-  // Có Hán tự → giữ nguyên (không dịch)
   if (hasChinese(trimmed)) return trimmed;
 
-  // Map local trước
   const key = trimmed.toLowerCase().replace(/\s+/g, ' ').trim();
   if (EN_MEANING_MAP[key]) return EN_MEANING_MAP[key];
-
-  // Không phải chuỗi chữ Latin (số, ký tự) → giữ nguyên
   if (!/[a-zA-Z]/.test(trimmed)) return trimmed;
 
-  // Còn lại → nhờ Gemini dịch
   try {
     const translated = await callGeminiWithRetry(
       `Dịch nghĩa sau sang TIẾNG VIỆT. CHỈ trả về duy nhất bản dịch tiếng Việt ngắn gọn, không thêm giải thích, không xuống dòng.\n\nTừ: "${trimmed}"`,
@@ -276,9 +340,9 @@ async function callGeminiWithRetry(prompt, mime, schema, retries = 2, delayMs = 
 }
 
 // ============================================================
-//      LOCAL QUIZ GENERATOR — 100% TIẾNG VIỆT, KHÓ → DỄ
+//      LOCAL QUIZ GENERATOR — 100% TIẾNG VIỆT, DỄ → KHÓ
 // ============================================================
-const DISTRACTOR_POOL = [
+const DISTRACTOR_MEANINGS = [
   // Chào hỏi / lịch sự
   'xin chào', 'cảm ơn', 'tạm biệt', 'xin lỗi', 'không có gì', 'làm ơn',
   // Đồ ăn / đồ uống
@@ -297,57 +361,193 @@ const DISTRACTOR_POOL = [
   'một', 'hai', 'ba', 'bốn', 'năm', 'sáu', 'bảy', 'tám', 'chín', 'mười',
 ];
 
+const PINYIN_DISTRACTOR_POOL = [
+  'mā', 'má', 'mǎ', 'mà',
+  'bā', 'bá', 'bǎ', 'bà',
+  'hǎo', 'hào', 'háo', 'hāo',
+  'shì', 'shí', 'shǐ', 'shī',
+  'zhōng', 'zhòng', 'chōng', 'chóng',
+  'guó', 'guò', 'guǒ', 'guō',
+  'rén', 'rèn', 'rěn', 'rēn',
+  'dà', 'dá', 'dǎ', 'dā',
+  'xiǎo', 'xiào', 'xiáo', 'xiāo',
+  'shuǐ', 'shuì', 'shuí', 'shuī',
+  'huǒ', 'huò', 'huō', 'huó',
+  'shān', 'shàn', 'shǎn', 'shán',
+  'tiān', 'tián', 'tiǎn', 'tiàn',
+  'dì', 'dí', 'dǐ', 'dī',
+  'nǐ', 'ní', 'nì', 'nī',
+  'wǒ', 'wó', 'wò', 'wō',
+  'tā', 'tá', 'tǎ', 'tà',
+  'men', 'mén', 'měn', 'mèn',
+  'xué', 'xuě', 'xuè', 'xuē',
+  'shēng', 'shéng', 'shěng', 'shèng',
+];
+
+const HANZI_DISTRACTOR_POOL = [
+  '你', '我', '他', '她', '们', '好', '是', '的', '了', '在',
+  '中', '国', '人', '大', '小', '水', '火', '山', '天', '地',
+  '日', '月', '年', '时', '学', '生', '老', '师', '朋', '友',
+  '家', '父', '母', '兄', '弟', '姐', '妹', '吃', '喝', '看',
+  '听', '说', '读', '写', '走', '来', '去', '回', '买', '卖',
+  '红', '黄', '蓝', '绿', '白', '黑', '长', '短', '高', '低',
+];
+
+function pickMeaningOptions(correct, allTranslations, n = 4) {
+  const used = new Set([correct, ...(allTranslations || [])]);
+  const pool = shuffle(DISTRACTOR_MEANINGS.filter(d => !used.has(d)));
+  const picked = pool.slice(0, n - 1);
+  return shuffle([correct, ...picked]);
+}
+
+function pickPinyinOptions(correct, n = 4) {
+  const pool = shuffle(PINYIN_DISTRACTOR_POOL.filter(p => p !== correct));
+  const picked = [];
+  for (const p of pool) {
+    if (picked.length >= n - 1) break;
+    if (!picked.includes(p)) picked.push(p);
+  }
+  return shuffle([correct, ...picked]);
+}
+
+function pickHanziOptions(correct, n = 4) {
+  const pool = shuffle(HANZI_DISTRACTOR_POOL.filter(h => h !== correct));
+  const picked = [];
+  for (const p of pool) {
+    if (picked.length >= n - 1) break;
+    if (!picked.includes(p)) picked.push(p);
+  }
+  return shuffle([correct, ...picked]);
+}
+
 /**
- * Templates từ KHÓ → DỄ.
- * difficulty 5 = khó nhất (ít gợi ý), 1 = dễ nhất (nhiều gợi ý).
+ * Sinh template đa dạng loại câu: meaning / pinyin / hanzi / fill_*.
+ * difficulty 1 = dễ nhất, 5 = khó nhất.
  */
-function buildTemplates(hanzi, pinyin) {
+function buildLocalTemplates(word) {
+  const hanzi = word?.hanzi || '?';
+  const pinyin = word?.pinyin || '?';
+  const translations = Array.isArray(word?.translations) && word.translations.length
+    ? word.translations
+    : [pinyin];
+  const meaning = translations[0];
+
   return [
-    { text: `Nghĩa của Hán tự "${hanzi}" là gì?`,                        difficulty: 5 },
-    { text: `"${hanzi}" có nghĩa là gì?`,                                 difficulty: 5 },
-    { text: `Chọn nghĩa đúng của "${hanzi}".`,                             difficulty: 4 },
-    { text: `Hán tự "${hanzi}" tương ứng với nghĩa nào?`,                  difficulty: 4 },
-    { text: `Từ "${hanzi}" (${pinyin}) có nghĩa là gì?`,                   difficulty: 3 },
-    { text: `Phiên âm "${pinyin}" tương ứng với nghĩa nào?`,               difficulty: 3 },
-    { text: `Chọn đáp án đúng cho "${hanzi}" (${pinyin}).`,                 difficulty: 2 },
-    { text: `Từ "${hanzi}" đọc là "${pinyin}", nghĩa là gì?`,              difficulty: 2 },
-    { text: `Hãy chọn nghĩa phù hợp với "${hanzi}" — "${pinyin}".`,         difficulty: 1 },
-    { text: `Đâu là nghĩa đúng của "${hanzi}" (${pinyin})?`,               difficulty: 1 },
+    // ---------- DỄ (1-2) ----------
+    {
+      type: 'meaning',
+      difficulty: 1,
+      question: `Hãy chọn nghĩa phù hợp với Hán tự "${hanzi}" (đọc là "${pinyin}").`,
+      options: pickMeaningOptions(meaning, translations, 4),
+      answer: meaning,
+      explanation: `"${hanzi}" đọc là "${pinyin}", nghĩa là: ${meaning}.`,
+    },
+    {
+      type: 'hanzi',
+      difficulty: 2,
+      question: `Từ tiếng Việt "${meaning}" (đọc là "${pinyin}") tương ứng với Hán tự nào?`,
+      options: pickHanziOptions(hanzi, 4),
+      answer: hanzi,
+      explanation: `"${meaning}" đọc là "${pinyin}", viết là "${hanzi}".`,
+    },
+    {
+      type: 'pinyin',
+      difficulty: 2,
+      question: `Hán tự "${hanzi}" (nghĩa: ${meaning}) có phiên âm (pinyin) nào?`,
+      options: pickPinyinOptions(pinyin, 4),
+      answer: pinyin,
+      explanation: `"${hanzi}" đọc là "${pinyin}", nghĩa là: ${meaning}.`,
+    },
+    // ---------- TRUNG BÌNH (3) ----------
+    {
+      type: 'fill_meaning',
+      difficulty: 3,
+      question: `Điền vào chỗ trống: Hán tự "${hanzi}" (${pinyin}) có nghĩa là ___.`,
+      options: pickMeaningOptions(meaning, translations, 4),
+      answer: meaning,
+      explanation: `"${hanzi}" (${pinyin}) nghĩa là: ${meaning}.`,
+    },
+    {
+      type: 'meaning',
+      difficulty: 3,
+      question: `Từ "${hanzi}" (${pinyin}) có nghĩa là gì?`,
+      options: pickMeaningOptions(meaning, translations, 4),
+      answer: meaning,
+      explanation: `"${hanzi}" (${pinyin}) nghĩa là: ${meaning}.`,
+    },
+    {
+      type: 'fill_hanzi',
+      difficulty: 3,
+      question: `Điền Hán tự thích hợp vào chỗ trống: "___" (đọc là "${pinyin}") có nghĩa là "${meaning}".`,
+      options: pickHanziOptions(hanzi, 4),
+      answer: hanzi,
+      explanation: `Hán tự "${hanzi}" đọc là "${pinyin}", nghĩa là: ${meaning}.`,
+    },
+    // ---------- KHÓ (4-5) ----------
+    {
+      type: 'pinyin',
+      difficulty: 4,
+      question: `Hán tự "${hanzi}" có pinyin là gì?`,
+      options: pickPinyinOptions(pinyin, 4),
+      answer: pinyin,
+      explanation: `"${hanzi}" đọc là "${pinyin}", nghĩa là: ${meaning}.`,
+    },
+    {
+      type: 'hanzi',
+      difficulty: 4,
+      question: `Hán tự nào có nghĩa là "${meaning}"?`,
+      options: pickHanziOptions(hanzi, 4),
+      answer: hanzi,
+      explanation: `"${meaning}" viết là "${hanzi}" (${pinyin}).`,
+    },
+    {
+      type: 'meaning',
+      difficulty: 5,
+      question: `Nghĩa của Hán tự "${hanzi}" là gì?`,
+      options: pickMeaningOptions(meaning, translations, 4),
+      answer: meaning,
+      explanation: `"${hanzi}" (${pinyin}) nghĩa là: ${meaning}.`,
+    },
   ];
 }
 
 function generateLocalQuiz(word, count = 5) {
-  const hanzi = word?.hanzi || '?';
-  const pinyin = word?.pinyin || '?';
-  const meaning = (word?.translations?.[0]) || pinyin;
+  const templates = buildLocalTemplates(word);
 
-  const templates = buildTemplates(hanzi, pinyin);
-
-  const questions = [];
-  for (let i = 0; i < count; i++) {
-    const tmpl = templates[Math.min(i, templates.length - 1)];
-
-    const picked = DISTRACTOR_POOL
-      .filter(d => d !== meaning)
-      .sort(() => Math.random() - 0.5)
-      .slice(0, 3);
-
-    const options = [meaning, ...picked]
-      .filter((v, idx, arr) => arr.indexOf(v) === idx)
-      .sort(() => Math.random() - 0.5);
-
-    questions.push({
-      question: tmpl.text,
-      options,
-      answer: meaning,
-      explanation: `"${hanzi}" (${pinyin}) có nghĩa là: ${meaning}.`,
-      difficulty: tmpl.difficulty,
-    });
+  // Nhóm theo loại để round-robin đảm bảo đa dạng loại câu
+  const byType = {};
+  for (const t of templates) {
+    (byType[t.type] = byType[t.type] || []).push(t);
+  }
+  for (const k of Object.keys(byType)) {
+    byType[k] = shuffle(byType[k]);
   }
 
-  // Sắp xếp KHÓ → DỄ
-  questions.sort((a, b) => b.difficulty - a.difficulty);
-  return questions;
+  const types = Object.keys(byType);
+  const picked = [];
+  const selected = new Set();
+  let i = 0;
+  while (picked.length < count && types.some(t => byType[t].length > 0)) {
+    const type = types[i % types.length];
+    if (byType[type].length > 0) {
+      const item = byType[type].shift();
+      picked.push(item);
+      selected.add(item);
+    }
+    i++;
+  }
+  // Nếu còn thiếu thì bù từ các template chưa chọn
+  for (const t of shuffle(templates)) {
+    if (picked.length >= count) break;
+    if (!selected.has(t)) {
+      picked.push(t);
+      selected.add(t);
+    }
+  }
+
+  // Sắp xếp DỄ → KHÓ
+  picked.sort((a, b) => a.difficulty - b.difficulty);
+  return picked.slice(0, count);
 }
 
 // ============================================================
@@ -365,21 +565,17 @@ app.post('/api/ai/vocab-quiz', async (req, res) => {
     let rawTranslations = Array.isArray(word?.translations) ? word.translations : [];
     if (rawTranslations.length === 0) rawTranslations = [pinyin];
 
-    // Dịch từng nghĩa nếu còn tiếng Anh
     let translations = await Promise.all(
       rawTranslations.map(t => translateMeaningToVietnamese(String(t || '')))
     );
-    translations = translations
-      .map(t => t.trim())
-      .filter(Boolean);
-    // Dedup
+    translations = translations.map(t => t.trim()).filter(Boolean);
     translations = [...new Set(translations)];
     if (translations.length === 0) translations = [pinyin];
 
     const n = Math.max(1, Math.min(10, Number(count) || 5));
     const cleanedWord = { hanzi, pinyin, translations };
 
-    // ---------- Prompt cho Gemini (đã có nghĩa tiếng Việt) ----------
+    // ---------- Prompt cho Gemini ----------
     const prompt = `Bạn là giáo viên tiếng Trung soạn bài tập trắc nghiệm cho học sinh người Việt.
 
 Từ vựng cần ôn:
@@ -388,24 +584,39 @@ Từ vựng cần ôn:
 - Nghĩa tiếng Việt (đã chuẩn hoá): ${translations.join(' / ')}
 
 ⚠️ QUY TẮC NGÔN NGỮ (BẮT BUỘC):
-- TOÀN BỘ "question", "options", "answer", "explanation" PHẢI viết bằng TIẾNG VIỆT.
-- TUYỆT ĐỐI KHÔNG dùng tiếng Anh (không "hello", "thank you", "what is", "choose", "meaning"...).
+- "question" và "explanation" PHẢI viết bằng TIẾNG VIỆT.
+- TUYỆT ĐỐI KHÔNG dùng tiếng Anh (không "hello", "thank you", "what is", "choose", "meaning", "the", "which"...).
 - Chỉ được giữ nguyên Hán tự và pinyin trong câu hỏi khi cần.
-- "answer" BẮT BUỘC là 1 phần tử trong "options" và BẮT BUỘC là 1 trong các nghĩa tiếng Việt ở trên.
-- Ví dụ SAI: options = ["hello", "thank you", "goodbye", "sorry"]
-- Ví dụ ĐÚNG: options = ["xin chào", "cảm ơn", "tạm biệt", "xin lỗi"]
 
-⚠️ ĐỘ KHÓ (SẮP XẾP TỪ KHÓ → DỄ):
-- Câu 1..${n}: sắp xếp GIẢM DẦN độ khó.
-- Câu KHÓ NHẤT: chỉ cho Hán tự "${hanzi}", KHÔNG gợi ý pinyin.
-- Câu khó: Hán tự + pinyin.
-- Câu trung bình: Hán tự + pinyin + ngữ cảnh.
-- Câu dễ: cho nhiều gợi ý (Hán tự + pinyin + mô tả chủ đề).
+⚠️ ĐÁP ÁN TRONG CÙNG 1 CÂU HỎI PHẢI CÙNG 1 LOẠI NGÔN NGỮ (BẮT BUỘC):
+- Câu loại "meaning" / "fill_meaning" (hỏi nghĩa)  → TẤT CẢ "options" là TIẾNG VIỆT.
+- Câu loại "pinyin"                                 → TẤT CẢ "options" là PINYIN.
+- Câu loại "hanzi" / "fill_hanzi" (chọn Hán tự)     → TẤT CẢ "options" là HÁN TỰ.
+- Câu loại "fill_blank" (điền khuyết)               → TẤT CẢ "options" cùng là Hán tự HOẶC cùng là tiếng Việt.
+- "answer" BẮT BUỘC nằm trong "options".
+- Với loại "meaning", "answer" BẮT BUỘC là 1 trong các nghĩa: ${translations.join(' / ')}.
+- Ví dụ SAI: options = ["hello", "cảm ơn", "tạm biệt", "xin lỗi"] (trộn tiếng Anh + Việt)
+- Ví dụ ĐÚNG (meaning): options = ["xin chào", "cảm ơn", "tạm biệt", "xin lỗi"]
+- Ví dụ ĐÚNG (pinyin):  options = ["nǐ hǎo", "xiè xie", "zài jiàn", "duì bu qǐ"]
+- Ví dụ ĐÚNG (hanzi):   options = ["你好", "谢谢", "再见", "对不起"]
 
-Hãy tạo ĐÚNG ${n} câu hỏi. Mỗi câu gồm:
+⚠️ ĐA DẠNG LOẠI CÂU HỎI (BẮT BUỘC):
+Trong ${n} câu phải có ĐỦ các loại sau (nếu đủ số lượng):
+- "meaning"     — hỏi nghĩa tiếng Việt của Hán tự.
+- "pinyin"      — hỏi phiên âm pinyin của Hán tự.
+- "hanzi"       — cho nghĩa tiếng Việt, chọn Hán tự đúng.
+- "fill_blank"  — câu điền khuyết (chỗ trống là Hán tự hoặc nghĩa, tuỳ ngữ cảnh).
+
+⚠️ ĐỘ KHÓ (SẮP XẾP TĂNG DẦN: DỄ → KHÓ):
+- Câu 1 (DỄ NHẤT): cho đầy đủ Hán tự + pinyin + gợi ý nghĩa.
+- Các câu giữa (TRUNG BÌNH): cho Hán tự + pinyin.
+- Câu cuối (KHÓ NHẤT): chỉ cho Hán tự, KHÔNG pinyin, KHÔNG gợi ý.
+
+Hãy tạo ĐÚNG ${n} câu hỏi, sắp xếp từ DỄ đến KHÓ. Mỗi câu gồm:
+- "type": một trong "meaning" | "pinyin" | "hanzi" | "fill_blank"
 - "question": câu hỏi TIẾNG VIỆT (có thể chèn Hán tự + pinyin)
-- "options": MẢNG 4 lựa chọn — TẤT CẢ bằng TIẾNG VIỆT
-- "answer": lựa chọn ĐÚNG — TIẾNG VIỆT, phải nằm trong "options"
+- "options": MẢNG 4 lựa chọn — TẤT CẢ cùng 1 loại ngôn ngữ như quy tắc trên
+- "answer": lựa chọn ĐÚNG — phải nằm trong "options"
 - "explanation": giải thích ngắn bằng TIẾNG VIỆT
 
 Chỉ trả về DUY NHẤT một mảng JSON. KHÔNG thêm markdown, không thêm văn bản ngoài.`;
@@ -415,12 +626,13 @@ Chỉ trả về DUY NHẤT một mảng JSON. KHÔNG thêm markdown, không th�
       items: {
         type: 'object',
         properties: {
+          type: { type: 'string', enum: ['meaning', 'pinyin', 'hanzi', 'fill_blank'] },
           question: { type: 'string' },
           options: { type: 'array', items: { type: 'string' } },
           answer: { type: 'string' },
           explanation: { type: 'string' },
         },
-        required: ['question', 'options', 'answer', 'explanation'],
+        required: ['type', 'question', 'options', 'answer', 'explanation'],
       },
     };
 
@@ -440,22 +652,30 @@ Chỉ trả về DUY NHẤT một mảng JSON. KHÔNG thêm markdown, không th�
         .map((q, idx) => {
           if (!q || typeof q !== 'object') return null;
 
-          // sanitize answer + options CÙNG NHAU để giữ tính nhất quán
           const rawOptions = Array.isArray(q.options) ? q.options : [];
           const sanitizedOptions = rawOptions
             .map(sanitizeText)
             .map(s => String(s).trim())
             .filter(Boolean);
-          // dedupe options
           const uniqueOptions = [...new Set(sanitizedOptions)];
 
+          // difficulty ước lượng theo vị trí (dễ → khó) nếu AI trả đúng thứ tự
+          const difficulty = 1 + Math.round(
+            (idx / Math.max(1, quizArray.length - 1)) * 4
+          );
+
           const cleanQ = {
+            type: String(q.type || 'meaning').trim().toLowerCase(),
             question: sanitizeText(String(q.question || '')).trim(),
             options: uniqueOptions,
             answer: sanitizeText(String(q.answer || '')).trim(),
             explanation: sanitizeText(String(q.explanation || '')).trim(),
-            difficulty: Math.max(1, 5 - Math.floor(idx / 2)), // ước lượng giảm dần
+            difficulty,
           };
+
+          // Chuẩn hoá type về tập hợp cho phép
+          const allowed = ['meaning', 'pinyin', 'hanzi', 'fill_blank', 'fill_meaning', 'fill_hanzi'];
+          if (!allowed.includes(cleanQ.type)) cleanQ.type = 'meaning';
 
           // Validate cấu trúc
           if (
@@ -468,9 +688,12 @@ Chỉ trả về DUY NHẤT một mảng JSON. KHÔNG thêm markdown, không th�
             return null;
           }
 
-          // Loại nếu còn dính tiếng Anh
-          if (!isCleanQuestion(cleanQ)) {
-            console.warn('[vocab-quiz] Bỏ câu còn tiếng Anh:', cleanQ.question);
+          // Validate ngôn ngữ: options cùng loại + không dính tiếng Anh
+          if (!isCleanQuestion(cleanQ, translations)) {
+            console.warn(
+              '[vocab-quiz] Bỏ câu sai ngôn ngữ:',
+              cleanQ.type, '|', cleanQ.question, '|', cleanQ.options
+            );
             return null;
           }
           return cleanQ;
@@ -483,25 +706,25 @@ Chỉ trả về DUY NHẤT một mảng JSON. KHÔNG thêm markdown, không th�
         const aPref = preferred.has(a.answer) ? 0 : 1;
         const bPref = preferred.has(b.answer) ? 0 : 1;
         if (aPref !== bPref) return aPref - bPref;
-        return (b.difficulty || 0) - (a.difficulty || 0);
+        return (a.difficulty || 0) - (b.difficulty || 0);
       });
 
       finalQuiz = finalQuiz.slice(0, n);
     }
 
-    // Fallback local nếu thiếu câu
+    // ---------- Fallback local nếu thiếu câu ----------
     let usedFallback = false;
     if (finalQuiz.length < n) {
       const need = n - finalQuiz.length;
       const local = generateLocalQuiz(cleanedWord, need);
       // Gán difficulty thấp hơn để nằm cuối (dễ hơn)
-      local.forEach((q, i) => { q.difficulty = Math.max(1, (q.difficulty || 1) - 1); });
+      local.forEach(q => { q.difficulty = Math.max(1, (q.difficulty || 3) - 1); });
       finalQuiz = [...finalQuiz, ...local];
       usedFallback = true;
     }
 
-    // Đảm bảo sắp xếp cuối cùng KHÓ → DỄ
-    finalQuiz.sort((a, b) => (b.difficulty || 0) - (a.difficulty || 0));
+    // ---------- Sắp xếp cuối cùng: DỄ → KHÓ ----------
+    finalQuiz.sort((a, b) => (a.difficulty || 0) - (b.difficulty || 0));
 
     console.log(
       `[vocab-quiz] OK ${finalQuiz.length}/${n} câu (${Date.now() - t0}ms)` +
@@ -511,7 +734,7 @@ Chỉ trả về DUY NHẤT một mảng JSON. KHÔNG thêm markdown, không th�
     res.json({
       result: finalQuiz,
       fallback: usedFallback,
-      translations, // trả về nghĩa đã chuẩn hoá tiếng Việt cho client
+      translations,
     });
   } catch (error) {
     console.error('❌ Lỗi không mong đợi /api/ai/vocab-quiz:', error);
