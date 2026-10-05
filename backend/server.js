@@ -12,7 +12,15 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+// Route xử lý trang chủ (Sửa lỗi Cannot GET /)
+app.get('/', (req, res) => {
+  res.status(200).send('Server is running smoothly!');
+});
 
+// Route dành riêng cho UptimeRobot ping
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
 // Khởi tạo Google GenAI
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) {
